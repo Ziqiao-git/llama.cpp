@@ -48,6 +48,20 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
         const int   n_rot_l      = hparams.n_rot(il);
 
+        // DFlash: Extract layer-(il-1) output (= layer il input).
+        // Converter writes target_layer_ids as raw_id+1, so when GGUF id == il
+        // here, `inpL` is the output of HF layer (il-1) = raw_id -- matching
+        // MLX _LayerHook(layers[raw_id]) which captures the layer's output.
+        if (dflash && cparams.dflash_extract_enabled && !dflash->extract_layer_indices.empty()) {
+            for (size_t i = 0; i < dflash->extract_layer_indices.size(); ++i) {
+                if (dflash->extract_layer_indices[i] == il) {
+                    const std::string name = "dflash_extract_" + std::to_string(i);
+                    cb(inpL, name.c_str(), il);
+                    break;
+                }
+            }
+        }
+
         // norm
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -231,21 +245,6 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
-
-        // DFlash: Extract post-layer hidden states from target model.
-        // Hook captures layer-il's full forward output (post-residual), matching
-        // MLX reference (_LayerHook on layers[lid]). The converter writes
-        // target_layer_ids as (raw_id + 1), so GGUF id N maps directly to layer
-        // index N here, and `cur` is layer N's output.
-        if (dflash && cparams.dflash_extract_enabled && !dflash->extract_layer_indices.empty()) {
-            for (size_t i = 0; i < dflash->extract_layer_indices.size(); ++i) {
-                if (dflash->extract_layer_indices[i] == il) {
-                    const std::string name = "dflash_extract_" + std::to_string(i);
-                    cb(cur, name.c_str(), il);
-                    break;
-                }
-            }
-        }
 
         // input for next layer
         inpL = cur;
