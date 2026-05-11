@@ -2818,6 +2818,26 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 LLAMA_LOG_INFO("%s: DFlash block_size = %u, mask_token_id = %u\n",
                                __func__, hparams.dflash_block_size, hparams.dflash_mask_token_id);
 
+                // Sliding-window pattern. Optional; absent in Qwen DFlash.
+                if (ml.get_arr(LLM_KV_DFLASH_LAYER_SLIDING, hparams.dflash_layer_sliding, false)) {
+                    hparams.dflash_has_sliding = true;
+                    ml.get_key(LLM_KV_DFLASH_SLIDING_WINDOW, hparams.dflash_sliding_window, false);
+                    std::string s = "[";
+                    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                        if (il) s += ", ";
+                        s += hparams.dflash_layer_sliding[il] ? "sw" : "full";
+                    }
+                    s += "]";
+                    LLAMA_LOG_INFO("%s: DFlash layer_attn = %s, sliding_window = %u\n",
+                                   __func__, s.c_str(), hparams.dflash_sliding_window);
+                }
+
+                ml.get_key(LLM_KV_DFLASH_FINAL_LOGIT_SOFTCAP, hparams.dflash_final_logit_softcap, false);
+                if (hparams.dflash_final_logit_softcap > 0.0f) {
+                    LLAMA_LOG_INFO("%s: DFlash final_logit_softcap = %.2f\n",
+                                   __func__, hparams.dflash_final_logit_softcap);
+                }
+
                 type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_COGVLM:

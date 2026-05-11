@@ -1351,6 +1351,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
                 ggml_backend_tensor_set(pos_full, pos_data.data(), 0, n_total * sizeof(int32_t));
             }
+
+            // Causal-within-noise mask for sliding-window layers. ctx columns
+            // (k < n_ctx) are always visible (mask=0); noise→noise is causal
+            // (mask=-INF when k_noise > q_noise). Shape: [n_total, n_noise].
+            // F16 because flash-attention requires that dtype.
+            ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "inp_kq_mask_causal");
+            if (kq_mask) {
+                const size_t n_cells = (size_t)n_total * (size_t)n_noise;
+                std::vector<ggml_fp16_t> mask_data(n_cells);
+                const ggml_fp16_t F16_ZERO    = ggml_fp32_to_fp16(0.0f);
+                const ggml_fp16_t F16_NEG_INF = ggml_fp32_to_fp16(-INFINITY);
+                for (int64_t q = 0; q < n_noise; ++q) {
+                    ggml_fp16_t * row = mask_data.data() + q * n_total;
+                    for (int64_t k = 0; k < n_ctx; ++k) {
+                        row[k] = F16_ZERO;
+                    }
+                    for (int64_t k = 0; k < n_noise; ++k) {
+                        row[n_ctx + k] = (k <= q) ? F16_ZERO : F16_NEG_INF;
+                    }
+                }
+                ggml_backend_tensor_set(kq_mask, mask_data.data(), 0,
+                        mask_data.size() * sizeof(ggml_fp16_t));
+            }
         }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);

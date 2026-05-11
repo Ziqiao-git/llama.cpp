@@ -293,6 +293,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_DFLASH_TARGET_LAYER_IDS,     "%s.target_layer_ids"     },
     { LLM_KV_DFLASH_BLOCK_SIZE,           "%s.block_size"           },
     { LLM_KV_DFLASH_MASK_TOKEN_ID,        "%s.mask_token_id"        },
+    { LLM_KV_DFLASH_LAYER_SLIDING,        "%s.layer_sliding"        },
+    { LLM_KV_DFLASH_SLIDING_WINDOW,       "%s.attention.sliding_window" },
+    { LLM_KV_DFLASH_FINAL_LOGIT_SOFTCAP,  "%s.final_logit_softcapping" },
 
     { LLM_KV_SHORTCONV_L_CACHE, "%s.shortconv.l_cache" },
     // sentence-transformers dense modules feature dims

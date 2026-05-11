@@ -513,6 +513,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.mlp.experts.mlp.w1",              # nomic-bert-moe
             "model.layers.{bid}.block_sparse_moe.experts.up", # smallthinker
             "model.layers.{bid}.moe.up_proj",                       # step3.5
+            "model.layers.{bid}.experts.up_proj",                   # gemma4 (MLX dequant: split gate/up)
         ),
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
@@ -565,6 +566,7 @@ class TensorNameMap:
             "model.layers.{bid}.feed_forward.experts.gate_proj",        # llama4
             "model.layers.{bid}.block_sparse_moe.experts.gate",         # smallthinker
             "model.layers.{bid}.moe.gate_proj",                         # step3.5
+            "model.layers.{bid}.experts.gate_proj",                     # gemma4 (MLX dequant: split gate/up)
         ),
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (

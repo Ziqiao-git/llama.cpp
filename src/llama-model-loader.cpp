@@ -394,6 +394,7 @@ namespace GGUFMeta {
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int>>(enum llm_kv kid, std::vector<int> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {

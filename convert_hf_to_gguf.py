@@ -4920,6 +4920,26 @@ class DFlashModel(Qwen3Model):
         if mask_token_id is not None:
             self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.mask_token_id", mask_token_id)
 
+        # DFlash drafts can carry layer-wise sliding-window attention (e.g.
+        # Gemma 4 DFlash uses sliding for the first N layers, full for the
+        # last). Persist these so dflash decoder can build the correct
+        # attention mask per layer.
+        layer_types = self.hparams.get("layer_types") or []
+        if layer_types:
+            is_sliding = [t == "sliding_attention" for t in layer_types]
+            if any(is_sliding):
+                self.gguf_writer.add_array(f"{self.gguf_writer.arch}.layer_sliding", is_sliding)
+                sw = self.hparams.get("sliding_window")
+                if sw:
+                    self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.attention.sliding_window", int(sw))
+
+        # Final logit softcapping (Gemma 4 DFlash = 30.0; Qwen DFlash = None).
+        # When set we apply tanh(x/cap)*cap on lm_head output even if the
+        # paired target model has no softcap.
+        flsc = self.hparams.get("final_logit_softcapping")
+        if flsc:
+            self.gguf_writer.add_float32(f"{self.gguf_writer.arch}.final_logit_softcapping", float(flsc))
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name == "fc.weight":
             yield (name, data_torch)
@@ -7970,6 +7990,14 @@ class Gemma4Model(Gemma3Model):
             return # skip non-language model tensors
 
         name = name.replace("language_model.", "")
+
+        # MLX-quantized Gemma 4 stores fused expert tensors under
+        # `experts.switch_glu.{gate,up,down}_proj.weight`; the standard HF
+        # layout uses `experts.{gate,up,down}_proj`. Normalize so the regular
+        # tensor mapping + fuse_gate_up_exps path picks them up.
+        if ".experts.switch_glu." in name:
+            name = name.replace(".experts.switch_glu.", ".experts.")
+
         if name.endswith("router.scale"):
             name = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_INP, bid, ".scale")
             yield (name, data_torch)

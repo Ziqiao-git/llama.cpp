@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cassert>
+#include <vector>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -227,6 +228,18 @@ struct llama_hparams {
     uint32_t            n_dflash_target_layer_ids = 0;
     uint32_t dflash_block_size     = 16;
     uint32_t dflash_mask_token_id  = 0;
+
+    // Per-layer sliding/full attention pattern + window size. Gemma 4 DFlash
+    // uses sliding for the first 4 layers and full for the last; Qwen DFlash
+    // is full-only. 1 = sliding, 0 = full. Only first n_layer entries valid;
+    // dflash_has_sliding tracks whether GGUF actually provided this metadata.
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dflash_layer_sliding = {};
+    bool                                    dflash_has_sliding   = false;
+    uint32_t                                dflash_sliding_window = 0;
+
+    // Final logit softcapping applied on the dflash decoder's lm_head output.
+    // 0.0f means no softcap. Gemma 4 DFlash uses 30.0; Qwen DFlash uses none.
+    float dflash_final_logit_softcap = 0.0f;
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;

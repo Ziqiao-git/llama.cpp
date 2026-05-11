@@ -64,6 +64,18 @@ llm_build_dflash_decode::llm_build_dflash_decode(const llama_model & model, cons
     ggml_tensor * inp_pos_q = ggml_view_1d(ctx0, inp_pos_full, n_tokens,
             n_ctx * ggml_element_size(inp_pos_full));
 
+    // Causal mask for sliding-window layers: noise queries cannot see future
+    // noise positions; ctx is fully visible. shape = [n_tokens_kv, n_tokens].
+    // For full-attention layers we pass nullptr (bidirectional). F16 because
+    // flash-attention requires that dtype.
+    ggml_tensor * kq_mask_causal = nullptr;
+    if (hparams.dflash_has_sliding) {
+        kq_mask_causal = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_tokens_kv, n_tokens);
+        ggml_set_input(kq_mask_causal);
+        ggml_set_name(kq_mask_causal, "inp_kq_mask_causal");
+        cb(kq_mask_causal, "inp_kq_mask_causal", -1);
+    }
+
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
@@ -121,12 +133,20 @@ llm_build_dflash_decode::llm_build_dflash_decode(const llama_model & model, cons
                 );
         cb(Qcur, "Qcur_rope", il);
 
-        // Full attention (no causal mask)
+        // Sliding-window layers use a causal mask over noise (target ctx is
+        // fully visible). Full-attention layers use no mask. Match MLX
+        // DFlashAttention: ctx_keys + prop_keys with `mask = "causal"` (which
+        // in MLX means causal within the noise block when ctx_len + L <=
+        // sliding_window).
+        const bool il_sliding = hparams.dflash_has_sliding &&
+                                 hparams.dflash_layer_sliding[il];
+        ggml_tensor * kq_mask_il = il_sliding ? kq_mask_causal : nullptr;
+
         ggml_build_forward_expand(gf, Qcur);
         ggml_build_forward_expand(gf, Kcur);
         ggml_build_forward_expand(gf, Vcur);
 
-        ggml_tensor * cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, nullptr, kq_scale, il);
+        ggml_tensor * cur = build_attn_mha(Qcur, Kcur, Vcur, nullptr, kq_mask_il, nullptr, nullptr, kq_scale, il);
         cb(cur, "kqv_out", il);
 
         cur = build_lora_mm(layer.wo, cur);
@@ -162,14 +182,18 @@ llm_build_dflash_decode::llm_build_dflash_decode(const llama_model & model, cons
         cur = build_lora_mm(model.target_output, cur);
         cb(cur, "result_output", -1);
 
-        // Apply target-model final_logit_softcapping (Gemma 4: tanh(x/cap)*cap).
-        // Mirrors the target model's lm_head behaviour, since dflash decoder
-        // reuses target_output directly.
-        if (dflash && dflash->target_final_logit_softcap > 0.0f) {
-            const float cap = dflash->target_final_logit_softcap;
-            cur = ggml_scale(ctx0, cur, 1.0f / cap);
+        // Final logit softcap (tanh(x/cap)*cap). DFlash drafts may carry their
+        // own softcap in GGUF (`dflash.final_logit_softcapping`); fall back to
+        // the paired target model's softcap when the draft does not specify
+        // one. Both Gemma 4 paths converge on 30.0.
+        float softcap = hparams.dflash_final_logit_softcap;
+        if (softcap <= 0.0f && dflash && dflash->target_final_logit_softcap > 0.0f) {
+            softcap = dflash->target_final_logit_softcap;
+        }
+        if (softcap > 0.0f) {
+            cur = ggml_scale(ctx0, cur, 1.0f / softcap);
             cur = ggml_tanh(ctx0, cur);
-            cur = ggml_scale(ctx0, cur, cap);
+            cur = ggml_scale(ctx0, cur, softcap);
             cb(cur, "result_output_softcap", -1);
         }
 
