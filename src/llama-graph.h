@@ -105,6 +105,17 @@ struct llama_dflash {
 
     std::vector<ggml_tensor *> extract_tensors;
 
+    // Gemma 4 (and possibly other future targets) need a scale on the noise
+    // embedding lookup (target's tok_embd is used by the dflash decoder, and
+    // the target itself applies sqrt(n_embd) to that lookup). 0.0f means no
+    // scaling (e.g. Qwen3 targets).
+    float target_embed_scale = 0.0f;
+
+    // Gemma 4 has final_logit_softcapping=30 applied as tanh(x/cap)*cap on
+    // its lm_head output. The dflash decoder reuses target's lm_head, so we
+    // mirror this. 0.0f means no softcapping.
+    float target_final_logit_softcap = 0.0f;
+
     void clear() {
         target_features.clear();
         extract_tensors.clear();

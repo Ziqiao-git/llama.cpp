@@ -1218,17 +1218,38 @@ void llama_context::set_dflash(const llama_model * model) {
 
     dflash.extract_layer_indices.assign(
             dflash_hparams.dflash_target_layer_ids.begin(),
-            dflash_hparams.dflash_target_layer_ids.end()
+            dflash_hparams.dflash_target_layer_ids.begin() + dflash_hparams.n_dflash_target_layer_ids
             );
 
     dflash.extract_tensors.resize(dflash.extract_layer_indices.size(), nullptr);
 
-    LLAMA_LOG_INFO("%s: DFlash extraction enabled for layers [%d, %d, %d, %d, %d]\n", __func__,
-            dflash.extract_layer_indices[0],
-            dflash.extract_layer_indices[1],
-            dflash.extract_layer_indices[2],
-            dflash.extract_layer_indices[3],
-            dflash.extract_layer_indices[4]);
+    // Pull target-model-specific scaling factors from THIS context's model
+    // (which is the target). These are used by the dflash decoder graph build:
+    //   - Gemma 4 multiplies its tok_embd output by sqrt(n_embd). The dflash
+    //     decoder reuses the target's tok_embd for the noise tokens, so we
+    //     apply the same scale.
+    //   - Gemma 4 applies final_logit_softcapping (tanh(x/cap)*cap) on its
+    //     lm_head output. The dflash decoder reuses the target's lm_head
+    //     (target_output), so we apply the same softcap.
+    if (this->model.arch == LLM_ARCH_GEMMA4) {
+        dflash.target_embed_scale = sqrtf((float) this->model.hparams.n_embd);
+        dflash.target_final_logit_softcap = this->model.hparams.f_final_logit_softcapping;
+        LLAMA_LOG_INFO("%s: DFlash target = Gemma4: embed_scale=%.4f, final_logit_softcap=%.2f\n",
+                __func__, dflash.target_embed_scale, dflash.target_final_logit_softcap);
+    } else {
+        dflash.target_embed_scale = 0.0f;
+        dflash.target_final_logit_softcap = 0.0f;
+    }
+
+    {
+        std::string ids_str = "[";
+        for (size_t i = 0; i < dflash.extract_layer_indices.size(); ++i) {
+            if (i > 0) ids_str += ", ";
+            ids_str += std::to_string(dflash.extract_layer_indices[i]);
+        }
+        ids_str += "]";
+        LLAMA_LOG_INFO("%s: DFlash extraction enabled for layers %s\n", __func__, ids_str.c_str());
+    }
 }
 
 const float * llama_context::get_dflash_target_features() const {
@@ -1372,7 +1393,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         if (model.arch == LLM_ARCH_EAGLE3) {
             n_embd = 3 * hparams.eagle3_target_hidden_size;
         } else if (model.arch == LLM_ARCH_DFLASH) {
-            n_embd = (int64_t) hparams.dflash_target_layer_ids.size() * hparams.n_embd;
+            n_embd = (int64_t) hparams.n_dflash_target_layer_ids * hparams.n_embd;
         }
     }
     const int64_t n_vocab = model.vocab.n_tokens();
@@ -2517,6 +2538,21 @@ void llama_context::extract_dflash_features(const llama_ubatch & ubatch) {
         const size_t size_bytes = n_embd * n_tokens * sizeof(float);
         ggml_backend_tensor_get_async(backend, tensor, temp_layer_features.data(), 0, size_bytes);
         ggml_backend_sched_synchronize(sched.get());
+
+        // DEBUG: dump per-layer first/last 4 features of token 0 once per call
+        if (getenv("DFLASH_DUMP")) {
+            const float * t0 = temp_layer_features.data();
+            double sum = 0, sumsq = 0;
+            for (int64_t k = 0; k < n_embd; ++k) { sum += t0[k]; sumsq += (double)t0[k] * t0[k]; }
+            double mean = sum / (double) n_embd;
+            double var = sumsq / (double) n_embd - mean*mean;
+            fprintf(stderr,
+                "[DFLASH_DUMP] layer_idx=%zu first4=[%.6f, %.6f, %.6f, %.6f] last4=[%.6f, %.6f, %.6f, %.6f] mean=%.6f std=%.6f n_embd=%lld n_tok=%lld\n",
+                layer_idx, t0[0], t0[1], t0[2], t0[3],
+                t0[n_embd-4], t0[n_embd-3], t0[n_embd-2], t0[n_embd-1],
+                mean, std::sqrt(std::max(0.0, var)),
+                (long long)n_embd, (long long)n_tokens);
+        }
 
         for (int64_t token_idx = 0; token_idx < n_tokens; ++token_idx) {
             const float * src = temp_layer_features.data() + token_idx * n_embd;

@@ -221,7 +221,10 @@ struct llama_hparams {
     bool eagle3_norm_before_residual = false;
 
     // DFlash draft model
-    std::array<int, 5> dflash_target_layer_ids = {};
+    // bumped from 5 to 16 to support DFlash drafts that extract more than 5
+    // target hidden states (e.g. Qwen3.5-122B-A10B-DFlash and gemma-4-26B-A4B-it-DFlash use 6)
+    std::array<int, 16> dflash_target_layer_ids = {};
+    uint32_t            n_dflash_target_layer_ids = 0;
     uint32_t dflash_block_size     = 16;
     uint32_t dflash_mask_token_id  = 0;
 

@@ -1,7 +1,7 @@
 #include "models.h"
 
 ggml_tensor * llm_build_dflash_encode::build_inp_embd() const {
-    const int64_t n_target_layer_ids = (int64_t) hparams.dflash_target_layer_ids.size();
+    const int64_t n_target_layer_ids = (int64_t) hparams.n_dflash_target_layer_ids;
     const int64_t n_embd_target_features = n_target_layer_ids * n_embd;
 
     auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_target_features);
@@ -39,6 +39,13 @@ llm_build_dflash_decode::llm_build_dflash_decode(const llama_model & model, cons
     GGML_ASSERT(model.target_tok_embd != nullptr && "DFlash decoder requires target model's tok_embd");
     ggml_tensor * noise_embd = build_inp_embd(model.target_tok_embd);
     cb(noise_embd, "inp_noise_embd", -1);
+
+    // Apply target-model embedding scale (Gemma 4 multiplies tok_embd output
+    // by sqrt(n_embd); other targets like Qwen3 leave it untouched).
+    if (dflash && dflash->target_embed_scale > 0.0f) {
+        noise_embd = ggml_scale(ctx0, noise_embd, dflash->target_embed_scale);
+        cb(noise_embd, "inp_noise_embd_scaled", -1);
+    }
 
     // Target context via llama_cross (filled from accumulated_target_ctx), graph rebuilds every step
     ggml_tensor * target_ctx = build_inp_cross_embd();
@@ -154,6 +161,18 @@ llm_build_dflash_decode::llm_build_dflash_decode(const llama_model & model, cons
     if (model.target_output) {
         cur = build_lora_mm(model.target_output, cur);
         cb(cur, "result_output", -1);
+
+        // Apply target-model final_logit_softcapping (Gemma 4: tanh(x/cap)*cap).
+        // Mirrors the target model's lm_head behaviour, since dflash decoder
+        // reuses target_output directly.
+        if (dflash && dflash->target_final_logit_softcap > 0.0f) {
+            const float cap = dflash->target_final_logit_softcap;
+            cur = ggml_scale(ctx0, cur, 1.0f / cap);
+            cur = ggml_tanh(ctx0, cur);
+            cur = ggml_scale(ctx0, cur, cap);
+            cb(cur, "result_output_softcap", -1);
+        }
+
         res->t_logits = cur;
     }
 

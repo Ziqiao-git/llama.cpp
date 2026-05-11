@@ -232,6 +232,21 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // DFlash: Extract post-layer hidden states from target model.
+        // Hook captures layer-il's full forward output (post-residual), matching
+        // MLX reference (_LayerHook on layers[lid]). The converter writes
+        // target_layer_ids as (raw_id + 1), so GGUF id N maps directly to layer
+        // index N here, and `cur` is layer N's output.
+        if (dflash && cparams.dflash_extract_enabled && !dflash->extract_layer_indices.empty()) {
+            for (size_t i = 0; i < dflash->extract_layer_indices.size(); ++i) {
+                if (dflash->extract_layer_indices[i] == il) {
+                    const std::string name = "dflash_extract_" + std::to_string(i);
+                    cb(cur, name.c_str(), il);
+                    break;
+                }
+            }
+        }
+
         // input for next layer
         inpL = cur;
     }
