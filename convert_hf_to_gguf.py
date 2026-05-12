@@ -3079,6 +3079,7 @@ class LlamaModel(TextModel):
         # EAGLE3: If no lm_head in draft model, load from target model
         if hasattr(self, 'is_eagle3') and self.is_eagle3 and "lm_head.weight" not in self.model_tensors:
             from safetensors import safe_open
+            assert self.target_model_dir is not None, "EAGLE3 requires --target-model-dir"
             for sf_file in self.target_model_dir.glob("*.safetensors"):
                 with safe_open(sf_file, framework="pt") as f:
                     if "lm_head.weight" in f.keys():
