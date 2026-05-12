@@ -155,6 +155,7 @@ models = [
     {"name": "joyai-llm",        "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/jdopensource/JoyAI-LLM-Flash", },
     {"name": "kanana2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/kakaocorp/kanana-2-30b-a3b-instruct-2601", },
     {"name": "f2llmv2",          "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/codefuse-ai/F2LLM-v2-4B", },
+    {"name": "gemma4",           "tokt": TOKENIZER_TYPE.BPE, "repo": "https://huggingface.co/google/gemma-4-26B-A4B-it", "chkhsh": "965417e14157fd7a6a0b06b35020c004476eda4ca00e9f365ca638b78c888723"},
 ]
 
 # some models are known to be broken upstream, so we will skip them as exceptions

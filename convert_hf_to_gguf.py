@@ -1339,10 +1339,6 @@ class TextModel(ModelBase):
         if chkhsh == "d4540891389ea895b53b399da6ac824becc30f2fba0e9ddbb98f92e55ca0e97c":
             # ref: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
             res = "qwen2"
-        if chkhsh == "965417e14157fd7a6a0b06b35020c004476eda4ca00e9f365ca638b78c888723":
-            # ref: https://huggingface.co/google/gemma-4-26B-A4B-it (BPE tokenizer.json)
-            # used by DFlash drafts that piggyback on Gemma 4 vocab via target-model-dir
-            res = "gemma4"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"
@@ -1550,6 +1546,9 @@ class TextModel(ModelBase):
         if chkhsh == "862f827721df956049dff5ca81a57f29e575280bc622e290d3bf4e35eca29015":
             # ref: https://huggingface.co/codefuse-ai/F2LLM-v2-4B
             res = "f2llmv2"
+        if chkhsh == "965417e14157fd7a6a0b06b35020c004476eda4ca00e9f365ca638b78c888723":
+            # ref: https://huggingface.co/google/gemma-4-26B-A4B-it
+            res = "gemma4"
 
         if res is None:
             logger.warning("\n")
