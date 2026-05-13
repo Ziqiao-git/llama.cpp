@@ -1352,21 +1352,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ggml_backend_tensor_set(pos_full, pos_data.data(), 0, n_total * sizeof(int32_t));
             }
 
-            // Causal-within-noise mask for sliding-window layers. ctx columns
-            // (k < n_ctx) are always visible (mask=0); noise→noise is causal
-            // (mask=-INF when k_noise > q_noise). Shape: [n_total, n_noise].
-            // F16 because flash-attention requires that dtype.
+            // Causal sliding-window mask for SW layers.
+            // - ctx column k is visible to noise query q iff
+            //   q_pos - k <= sliding_window - 1, where q_pos = ubatch.pos[q]
+            //   when available (server / continuation), else n_ctx + q
+            //   (single-stream initial decode).
+            // - noise column (n_ctx + j) is visible to noise query q iff
+            //   j <= q (causal within block; no sliding needed because
+            //   block_size << sliding_window).
+            // Mirrors spiritbuun/buun-llama-cpp SD-073 mask construction
+            // and MLX `create_causal_mask(L, offset=ctx_len, window_size=W)`
+            // when ctx_len + L > sliding_window. For shorter contexts
+            // (q_pos - k always within window) this collapses to "ctx fully
+            // visible + noise causal", same as the prior implementation.
+            // Shape: [n_total, n_noise]. F16 because flash-attn requires it.
             ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "inp_kq_mask_causal");
             if (kq_mask) {
                 const size_t n_cells = (size_t)n_total * (size_t)n_noise;
                 std::vector<ggml_fp16_t> mask_data(n_cells);
                 const ggml_fp16_t F16_ZERO    = ggml_fp32_to_fp16(0.0f);
                 const ggml_fp16_t F16_NEG_INF = ggml_fp32_to_fp16(-INFINITY);
+
+                const uint32_t window = model.hparams.dflash_sliding_window;
+                const bool     have_pos = (ubatch.pos != nullptr) &&
+                                          ((int64_t) ubatch.n_tokens >= n_noise);
+
                 for (int64_t q = 0; q < n_noise; ++q) {
                     ggml_fp16_t * row = mask_data.data() + q * n_total;
+                    const int32_t q_pos = have_pos
+                        ? ubatch.pos[q]
+                        : (int32_t)(n_ctx + q);
+
+                    // ctx columns: visible iff within sliding window
                     for (int64_t k = 0; k < n_ctx; ++k) {
-                        row[k] = F16_ZERO;
+                        if (window > 0 &&
+                            q_pos - (int32_t) k >= (int32_t) window) {
+                            row[k] = F16_NEG_INF;
+                        } else {
+                            row[k] = F16_ZERO;
+                        }
                     }
+                    // noise->noise: causal within block.
                     for (int64_t k = 0; k < n_noise; ++k) {
                         row[n_ctx + k] = (k <= q) ? F16_ZERO : F16_NEG_INF;
                     }
