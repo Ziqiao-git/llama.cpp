@@ -1,131 +1,101 @@
 # llama.cpp — DFlash + Gemma 4 on Apple Silicon
 
-This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) that
-adds **working Gemma 4 26B-A4B DFlash speculative decoding on Mac / Metal**.
-Base: PR [#22105](https://github.com/ggml-org/llama.cpp/pull/22105) HEAD
-(`67cb0d507`, 2026-04-27). All extra commits live on branch
+Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) adding
+working **Gemma 4 26B-A4B DFlash speculative decoding** on Mac / Metal,
+based on draft PR [#22105](https://github.com/ggml-org/llama.cpp/pull/22105)
+(commit `67cb0d507`, 2026-04-27). All additions live on branch
 [`dflash-swa-full-detect`](../../tree/dflash-swa-full-detect).
-
-For per-line review notes see [dflash_gemma4_review.md](../../blob/dflash-swa-full-detect/README_DFLASH_FORK.md)
-(this file) and `dflash_gemma4_review.md` outside the repo at the workspace root.
-
----
-
-## What this fork adds
-
-Three problems block Gemma 4 DFlash on stock #22105; this fork fixes all three.
-
-### 1. Variable-length `target_layer_ids` (was hard-coded to 5)
-
-Stock #22105 stores `target_layer_ids` as `std::array<int, 5>`. The Gemma 4 26B-A4B
-DFlash draft and Qwen3.5-122B-A10B both ship **6** target layer ids and immediately
-crash with:
-
-```
-key dflash.target_layer_ids has wrong array length; expected 5, got 6
-```
-
-This fork bumps the slot to 16 and tracks the actual length via
-`n_dflash_target_layer_ids`. See commit [`b113d75a8`](../../commit/b113d75a8).
-
-### 2. Gemma 4 target plumbing
-
-Gemma 4 multiplies `tok_embd` by `sqrt(n_embd)` and softcaps logits with
-`tanh(x/30)*30`. The DFlash decoder reuses the target's `tok_embd` and
-`lm_head`, so it must mirror both. We also fix an off-by-one in the
-extraction hook for Gemma 4 specifically (the analogous Qwen 3.5 hook reads
-`inpL` at the layer top; the original Gemma 4 hook read `cur` at the layer
-bottom, one layer too far). See commits
-[`b113d75a8`](../../commit/b113d75a8) and [`e60583afb`](../../commit/e60583afb).
-
-### 3. Per-layer sliding-window attention in the DFlash decoder
-
-Gemma 4 DFlash drafts use a mix of sliding-window and full-attention layers
-(`[SW, SW, SW, SW, full]`, window=2048). Without sliding-window-aware causal
-masking the decoder runs every layer as bidirectional full-attention, halving
-accept rate. We pipe the per-layer pattern from the HF config through GGUF
-into a host-filled F16 mask tensor and pass it to `build_attn_mha` only on
-sliding layers. See commit [`cbfb7f7f2`](../../commit/cbfb7f7f2).
-
-The same commit also wires DFlash's own `final_logit_softcapping` (independent
-of the target's) through GGUF, and adds an MLX-quantized→GGUF tensor-name
-translation so you can convert Gemma 4 GGUF target weights directly from MLX
-4bit safetensors (no fp16 source download needed).
-
-### 4. SWA mask uses absolute query position (not ubatch.pos)
-
-The fix in commit 3 enabled the SWA mask but used `ubatch.pos[q]` as the
-query's absolute sequence position. That looked correct but isn't, because
-the DFlash draft caller in [`common/speculative.cpp`](../../blob/dflash-swa-full-detect/common/speculative.cpp)
-populates `pos = i` (block-local 0..15) when adding noise tokens — its RoPE
-uses `inp_pos_full = [0..n_total-1]` instead and ignores `ubatch.pos`. As a
-result `q_pos - k` was always tiny and the sliding bound never triggered;
-on prompts longer than the sliding window the mask silently degraded to
-"ctx fully visible", and accept rate collapsed because the draft was
-attending to context ranges far outside its training distribution.
-
-Fix: compute `q_pos = n_ctx + q` directly (matching what RoPE uses), ignore
-`ubatch.pos` for this code path. See commit [`581cfec89`](../../commit/581cfec89).
-
-Impact (Gemma 4 26B-A4B-it Q4_K_M, M3 Max):
-
-| prompt tokens | before fix 4 | **after fix 4** |
-|---:|---:|---:|
-| 2212 (just over 2048 window) | 30.14% | **32.46%** (+2.3pp) |
-| 5657 | 26.28% | **48.33%** (+22.1pp) |
-| 8419 | 23.51% | **46.67%** (+23.2pp) |
-
-The 24 short-prompt gsm8k benchmark (all ≤102 tokens, well within the
-window) is unchanged at 40.08% — `q_pos - k < window` for every k so the
-mask collapses to the prior behavior.
-
----
 
 ## Result
 
-Benchmark: 24 gsm8k prompts (thinking on), temp=0, draft_max=16, M3 Max 40 GB.
+Gemma 4 26B-A4B-it, M3 Max 40 GB, temp=0, seed=42, draft_max=16.
 
-| Backend | target quant | tok/s | accept rate | accept length / 16 |
-|---|---|---:|---:|---:|
-| MLX 4bit (reference) | MLX affine 4bit (~15 GB) | 118.6 | **42.79%** | 7.85 |
-| MLX 8bit | MLX affine 8bit (~26 GB) | 98.0 | 44.30% | 8.09 |
-| **llama.cpp Q4_K_M (this fork)** | GGUF K-quant (~16 GB) | **49.1** | **40.08%** | 7.41 |
-| **llama.cpp Q8_0** (from MLX 4bit dequant) | GGUF Q8_0 (~25 GB) | **44.1** | **40.46%** | 7.47 |
+**Short prompts** — 24 gsm8k prompts with thinking, ctx ≤ 102 tokens:
 
-**Accept rate within ~2.7pp of MLX**. The 49 vs 118 t/s gap is the ggml-metal
-kernel vs MLX-Metal kernel — engine-level, not algorithmic. Same gap we
-observed on Qwen3.5-4B DFlash, unrelated to this fork.
+| backend | target quant | tok/s | accept rate |
+|---|---|---:|---:|
+| MLX 4bit (reference) | MLX affine 4bit (~15 GB) | 118.6 | 42.79% |
+| MLX 8bit | MLX affine 8bit (~26 GB) | 98.0 | 44.30% |
+| **llama.cpp Q4_K_M (this fork)** | GGUF K-quant (~16 GB) | **49.1** | **40.08%** |
+| llama.cpp Q8_0 (from MLX 4bit dequant) | GGUF Q8_0 (~25 GB) | 44.1 | 40.46% |
 
-### Long-prompt behavior (after fix 4)
-
-When the prompt exceeds the draft's sliding window (2048 tokens for Gemma 4
-DFlash), the SWA mask now correctly limits each noise query to the most
-recent `sliding_window` ctx tokens. Q4_K_M target, 256-token continuation,
-seed=42:
+**Long prompts** — single prompt, 256-token continuation, `-c <prompt+1024>`:
 
 | prompt tokens | accept rate | tok/s |
 |---:|---:|---:|
-| 2212 | 32.46% | 47.1 |
-| 5657 | 48.33% | 42.1 |
-| 8419 | 46.67% |  2.7 |
+|  2,212 | 32.46% | 47.1 |
+|  5,657 | 48.33% | 42.1 |
+|  8,419 | 46.67% |  2.7 |
 
-The 6k row tok/s collapses because Q4_K_M target + 8K ctx KV cache + 8K
-ubatch saturates the unified memory and we lose decode throughput to
-swap; the accept rate is still valid. Use `-c <prompt+1024> -b ub -ub ub`
-with the smallest ubatch that satisfies `ubatch >= prompt_tokens`.
+The 6k row's tok/s collapses because the Q4_K_M target plus an 8K ubatch
+saturates unified memory; the accept rate is unaffected.
 
-Acceptance got there from a 7.5% starting point through three sequential fixes:
+## Supported model matrix
 
-| Stage | Accept rate (24 prompts) | tok/s |
-|---|---:|---:|
-| Before any fix (broken extraction hook) | 7.5% (single prompt) | 18.7 |
-| + off-by-one hook fix (`e60583afb`) | 26.1% | 33.9 |
-| + apples-to-apples chat template + 24-prompt avg | 37.5% | 50.4 |
-| **+ per-layer sliding mask + softcap (`cbfb7f7f2`)** | **40.08%** | **49.08** |
+| Target | DFlash draft | Status |
+|---|---|---|
+| Qwen3.5 4B / 9B / 35B-A3B / 122B-A10B | matching DFlash | works (4B regression-tested at 40.7 t/s) |
+| Qwen3.6 35B-A3B | matching DFlash | inherits upstream #22105 support |
+| **Gemma 4 26B-A4B-it** | `z-lab/gemma-4-26B-A4B-it-DFlash` | **works (new in this fork)** |
+| Gemma 4 31B (dense) | `z-lab/gemma-4-31B-it-DFlash` | untested but same code paths |
 
----
+## What this fork changes
+
+Four classes of fix on top of #22105. Click commit hashes for details.
+
+### 1. Variable-length `target_layer_ids` ([`b113d75a8`](../../commit/b113d75a8))
+
+`#22105` hard-codes the array to 5. The Gemma 4 26B-A4B and Qwen3.5-122B
+drafts both ship **6** target layers and crash with
+`expected 5, got 6`. Bumped to a 16-slot array tracked by an explicit
+length counter.
+
+### 2. Gemma 4 target plumbing ([`b113d75a8`](../../commit/b113d75a8), [`e60583afb`](../../commit/e60583afb))
+
+The DFlash decoder reuses the target's `tok_embd` and `lm_head`, so it
+must mirror Gemma 4's `sqrt(n_embd)` embedding scale and
+`tanh(x/30)*30` logit softcap. Adds the corresponding fields to
+`llama_dflash`, populated when `model.arch == LLM_ARCH_GEMMA4`. Also
+adds the feature-extraction hook in `gemma4-iswa.cpp` (analogous to
+the existing Qwen 3.5 hook), reading `inpL` at the layer top.
+
+### 3. Per-layer sliding-window attention + own softcap + MLX→GGUF expert names ([`cbfb7f7f2`](../../commit/cbfb7f7f2))
+
+Gemma 4 DFlash drafts use `[SW, SW, SW, SW, full]` with `sliding_window=2048`.
+Adds three GGUF keys (`dflash.layer_sliding`, `dflash.attention.sliding_window`,
+`dflash.final_logit_softcapping`), an F16 mask tensor wired through
+`build_attn_mha` only on sliding layers, and a softcap path that prefers
+the DFlash GGUF value over the target's.
+
+Also adds an MLX→GGUF expert-tensor rename
+(`experts.switch_glu.{gate,up,down}_proj` → `experts.{gate,up,down}_proj`)
+so Gemma 4 GGUF target weights can be produced directly from MLX 4bit
+safetensors via `mlx_lm convert --dequantize` + the standard
+`--fuse-gate-up-exps` flag, with no need for the original BF16 source.
+
+### 4. SWA mask uses absolute query position ([`581cfec89`](../../commit/581cfec89))
+
+The DFlash draft caller populates the noise ubatch with `pos = i`
+(block-local 0..15). The SWA mask must reason about absolute sequence
+position to evaluate the sliding bound; compute `q_pos = n_ctx + q`
+directly instead of reading `ubatch.pos[q]`, matching what RoPE in
+`dflash.cpp` already does (`inp_pos_full = [0..n_total-1]`).
+
+Without this fix, the SWA bound never fires on long prompts: the mask
+silently degrades to "ctx fully visible", the draft attends to
+context ranges far outside its training distribution, and accept rate
+collapses (-22pp on 6k prompts).
+
+### CI plumbing ([`3a321a6af`](../../commit/3a321a6af), [`be202f0bb`](../../commit/be202f0bb))
+
+Registers `gemma4` in `convert_hf_to_gguf_update.py` so the
+pre-tokenizer-hashes CI check passes, and adds an `assert` in the
+EAGLE3 lm_head fallback so Python type-check passes. No functional
+change.
 
 ## Quick start
+
+### Build
 
 ```bash
 git clone -b dflash-swa-full-detect https://github.com/Ziqiao-git/llama.cpp.git
@@ -136,8 +106,7 @@ cmake --build build -j 8 --target llama-speculative-simple
 
 ### Convert Gemma 4 DFlash draft
 
-You need a target tokenizer dir (any HF-format Gemma 4 26B-A4B — MLX or
-Google's original works since we only need tokenizer files):
+Needs a target tokenizer directory (any HF-format Gemma 4 26B-A4B-it).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -150,21 +119,21 @@ PYTHONPATH=$PWD/gguf-py python convert_hf_to_gguf.py \
   --outfile gemma-4-26b-a4b-dflash.gguf
 ```
 
-(Pass local paths to anything that's already on disk.)
+### Convert Gemma 4 target from MLX 4bit (optional)
 
-### Convert Gemma 4 target from MLX 4bit (optional, only if you don't already
-have a target GGUF)
+If you don't already have a Gemma 4 target GGUF and want to avoid
+downloading the BF16 source:
 
 ```bash
 pip install mlx mlx-lm
 
-# Step 1: MLX 4bit → dequantized bf16 safetensors (~47 GB)
+# MLX 4bit → dequantized bf16 safetensors (~47 GB)
 python -m mlx_lm convert \
   --hf-path mlx-community/gemma-4-26b-a4b-it-4bit \
   --mlx-path gemma-4-26b-a4b-it-bf16-dequant \
   --dequantize
 
-# Step 2: bf16 → GGUF Q8_0 (~25 GB)
+# bf16 → GGUF Q8_0 (~25 GB)
 PYTHONPATH=$PWD/gguf-py python convert_hf_to_gguf.py \
   gemma-4-26b-a4b-it-bf16-dequant \
   --outtype q8_0 \
@@ -172,65 +141,61 @@ PYTHONPATH=$PWD/gguf-py python convert_hf_to_gguf.py \
   --outfile gemma-4-26B-A4B-it-Q8_0.gguf
 ```
 
-### Run speculative decoding
+### Run
+
+Short prompt:
 
 ```bash
 ./build/bin/llama-speculative-simple --dflash \
   -m gemma-4-26B-A4B-it-Q4_K_M.gguf \
   -md gemma-4-26b-a4b-dflash.gguf \
-  -p "Solve step by step: A train travels 60 mph for 2.5 hours, then 80 mph for 1.5 hours. Total distance?" \
+  -p "Solve step by step: ..." \
   -n 256 --temp 0 --top-k 1 --seed 42 --draft-max 16 -c 4096
 ```
 
-**`-c 4096` is required on M3 Max for Q8_0** — the default `n_ctx=262144`
-allocates an 80 GB KV cache and OOMs the GPU.
+Long prompt (e.g. ~5 700 tokens):
 
-Expected log lines (Gemma 4 path):
+```bash
+./build/bin/llama-speculative-simple --dflash \
+  -m gemma-4-26B-A4B-it-Q4_K_M.gguf \
+  -md gemma-4-26b-a4b-dflash.gguf \
+  -f long_prompt.txt \
+  -n 256 --temp 0 --top-k 1 --seed 42 --draft-max 16 \
+  -c 6700 -b 6144 -ub 6144
+```
+
+Required flags for long prompts on M3 Max:
+
+- `-c <prompt_tokens + 1024>`: don't oversize, KV cache scales with this
+- `-b <ubatch>` and `-ub <ubatch>`: ubatch must satisfy `ubatch >= prompt_tokens`
+  (encoder requires single-shot ingest) but should be the minimum that
+  works to keep compute buffer in budget
+
+Expected log lines on Gemma 4:
 
 ```
 load_hparams: DFlash layer_attn = [sw, sw, sw, sw, full], sliding_window = 2048
 load_hparams: DFlash final_logit_softcap = 30.00
 set_dflash: DFlash target = Gemma4: embed_scale=53.0660, final_logit_softcap=30.00
-...
-accept    = ~40%
 ```
 
----
+## Limitations
 
-## Supported models
-
-| Target | DFlash draft | Status on this fork |
-|---|---|---|
-| Qwen3.5 4B / 9B / 35B-A3B / 122B-A10B | matching DFlash | works (regression-tested 4B at 40.7 t/s, 28.7% accept) |
-| Qwen3.6 35B-A3B | matching DFlash | inherits upstream #22105 support |
-| **Gemma 4 26B-A4B-it** | `z-lab/gemma-4-26B-A4B-it-DFlash` | **works (new in this fork)** |
-| Gemma 4 31B (dense) | `z-lab/gemma-4-31B-it-DFlash` | not tested but should work — same code paths |
-
----
-
-## What's NOT in this fork
-
-- **No retest against latest llama.cpp master.** Branch is based on PR #22105's
-  HEAD (2026-04-27). Master since then merged #22506 (low-prob draft trim) and
-  #22679 (device-side spec checkpoint); rebasing would conflict in
-  `llama-context.cpp` and `llama-graph` — plan ~half a day.
-- **No Metal kernel optimization.** Closing the 49 vs 118 tok/s gap to MLX is
-  ggml-metal kernel work, unrelated to DFlash. Tracked in upstream #22400
-  (currently stalled on Apple).
-- **Default `n_ctx` is unchanged.** Users with limited GPU memory must pass
-  `-c 4096` explicitly.
-- **No CI / tests added.** Manual benchmark in `/tmp/run_q[48]_bench.sh`
-  reproduces the table above.
-
----
+- Branch is based on PR #22105's HEAD (2026-04-27). Upstream master has
+  since merged #22506 (low-prob draft trim) and #22679 (device-side spec
+  checkpoint); rebasing is unblocked work, not done here.
+- No Metal kernel optimization. The 49 vs 118 tok/s gap to MLX is engine-
+  level (ggml-metal vs MLX Metal kernel), unrelated to DFlash.
+- 24-prompt gsm8k regression bench is in the repo as bash scripts under
+  `/tmp/run_q[48]_bench.sh` (run-and-aggregate); no automated CI test
+  added.
 
 ## Credits
 
-- Base DFlash framework: [@ruixiang63](https://github.com/ruixiang63) and contributors in PR [#22105](https://github.com/ggml-org/llama.cpp/pull/22105)
-- DFlash algorithm: [z-lab/dflash](https://github.com/z-lab/dflash), MLX reference impl in [`dflash.model_mlx`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)
+- DFlash framework + Qwen support: [@ruixiang63](https://github.com/ruixiang63) et al. in [#22105](https://github.com/ggml-org/llama.cpp/pull/22105)
+- DFlash algorithm: [z-lab/dflash](https://github.com/z-lab/dflash); MLX reference in [`dflash/model_mlx.py`](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)
+- SWA mask construction pattern: cross-checked against [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp)'s SD-073 (their dflash draft caller emits absolute pos, ours doesn't, hence the q_pos hardcode in fix 4)
 - llama.cpp: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-
----
 
 ## License
 
