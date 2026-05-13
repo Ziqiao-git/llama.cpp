@@ -1353,18 +1353,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
 
             // Causal sliding-window mask for SW layers.
-            // - ctx column k is visible to noise query q iff
-            //   q_pos - k <= sliding_window - 1, where q_pos = ubatch.pos[q]
-            //   when available (server / continuation), else n_ctx + q
-            //   (single-stream initial decode).
+            // - ctx column k (in absolute sequence space, 0..n_ctx-1) is
+            //   visible to noise query q iff (n_ctx + q) - k < sliding_window.
             // - noise column (n_ctx + j) is visible to noise query q iff
             //   j <= q (causal within block; no sliding needed because
             //   block_size << sliding_window).
-            // Mirrors spiritbuun/buun-llama-cpp SD-073 mask construction
-            // and MLX `create_causal_mask(L, offset=ctx_len, window_size=W)`
-            // when ctx_len + L > sliding_window. For shorter contexts
-            // (q_pos - k always within window) this collapses to "ctx fully
-            // visible + noise causal", same as the prior implementation.
+            //
+            // NOTE on positions: the dflash draft caller in common/speculative.cpp
+            // builds the ubatch with `pos = i` (block-local 0..15), not the
+            // absolute sequence position. RoPE in dflash.cpp ignores ubatch.pos
+            // and uses inp_pos_full = [0..n_total-1] instead. The SWA mask must
+            // also reason about absolute positions, so we deliberately ignore
+            // ubatch.pos here and compute q_pos = n_ctx + q. Once #22105 (or its
+            // descendants) start emitting absolute pos in the dflash ubatch
+            // (spiritbuun/buun-llama-cpp already does for its dflash_draft path),
+            // this can switch to ubatch.pos[q].
+            //
+            // Mirrors MLX `create_causal_mask(L, offset=ctx_len, window_size=W)`.
             // Shape: [n_total, n_noise]. F16 because flash-attn requires it.
             ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "inp_kq_mask_causal");
             if (kq_mask) {
@@ -1374,14 +1379,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 const ggml_fp16_t F16_NEG_INF = ggml_fp32_to_fp16(-INFINITY);
 
                 const uint32_t window = model.hparams.dflash_sliding_window;
-                const bool     have_pos = (ubatch.pos != nullptr) &&
-                                          ((int64_t) ubatch.n_tokens >= n_noise);
 
                 for (int64_t q = 0; q < n_noise; ++q) {
                     ggml_fp16_t * row = mask_data.data() + q * n_total;
-                    const int32_t q_pos = have_pos
-                        ? ubatch.pos[q]
-                        : (int32_t)(n_ctx + q);
+                    const int32_t q_pos = (int32_t)(n_ctx + q);
 
                     // ctx columns: visible iff within sliding window
                     for (int64_t k = 0; k < n_ctx; ++k) {
