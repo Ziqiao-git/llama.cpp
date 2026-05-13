@@ -52,6 +52,33 @@ of the target's) through GGUF, and adds an MLX-quantized→GGUF tensor-name
 translation so you can convert Gemma 4 GGUF target weights directly from MLX
 4bit safetensors (no fp16 source download needed).
 
+### 4. SWA mask uses absolute query position (not ubatch.pos)
+
+The fix in commit 3 enabled the SWA mask but used `ubatch.pos[q]` as the
+query's absolute sequence position. That looked correct but isn't, because
+the DFlash draft caller in [`common/speculative.cpp`](../../blob/dflash-swa-full-detect/common/speculative.cpp)
+populates `pos = i` (block-local 0..15) when adding noise tokens — its RoPE
+uses `inp_pos_full = [0..n_total-1]` instead and ignores `ubatch.pos`. As a
+result `q_pos - k` was always tiny and the sliding bound never triggered;
+on prompts longer than the sliding window the mask silently degraded to
+"ctx fully visible", and accept rate collapsed because the draft was
+attending to context ranges far outside its training distribution.
+
+Fix: compute `q_pos = n_ctx + q` directly (matching what RoPE uses), ignore
+`ubatch.pos` for this code path. See commit [`581cfec89`](../../commit/581cfec89).
+
+Impact (Gemma 4 26B-A4B-it Q4_K_M, M3 Max):
+
+| prompt tokens | before fix 4 | **after fix 4** |
+|---:|---:|---:|
+| 2212 (just over 2048 window) | 30.14% | **32.46%** (+2.3pp) |
+| 5657 | 26.28% | **48.33%** (+22.1pp) |
+| 8419 | 23.51% | **46.67%** (+23.2pp) |
+
+The 24 short-prompt gsm8k benchmark (all ≤102 tokens, well within the
+window) is unchanged at 40.08% — `q_pos - k < window` for every k so the
+mask collapses to the prior behavior.
+
 ---
 
 ## Result
@@ -68,6 +95,24 @@ Benchmark: 24 gsm8k prompts (thinking on), temp=0, draft_max=16, M3 Max 40 GB.
 **Accept rate within ~2.7pp of MLX**. The 49 vs 118 t/s gap is the ggml-metal
 kernel vs MLX-Metal kernel — engine-level, not algorithmic. Same gap we
 observed on Qwen3.5-4B DFlash, unrelated to this fork.
+
+### Long-prompt behavior (after fix 4)
+
+When the prompt exceeds the draft's sliding window (2048 tokens for Gemma 4
+DFlash), the SWA mask now correctly limits each noise query to the most
+recent `sliding_window` ctx tokens. Q4_K_M target, 256-token continuation,
+seed=42:
+
+| prompt tokens | accept rate | tok/s |
+|---:|---:|---:|
+| 2212 | 32.46% | 47.1 |
+| 5657 | 48.33% | 42.1 |
+| 8419 | 46.67% |  2.7 |
+
+The 6k row tok/s collapses because Q4_K_M target + 8K ctx KV cache + 8K
+ubatch saturates the unified memory and we lose decode throughput to
+swap; the accept rate is still valid. Use `-c <prompt+1024> -b ub -ub ub`
+with the smallest ubatch that satisfies `ubatch >= prompt_tokens`.
 
 Acceptance got there from a 7.5% starting point through three sequential fixes:
 
